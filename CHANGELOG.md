@@ -1,5 +1,12 @@
 # Changelog
 
+### [1.103.2](https://www.github.com/googleapis/java-pubsub/compare/v1.103.1...v1.103.2) (2020-03-24)
+
+
+### Bug Fixes
+
+* Re-generated  to pick up changes in the API or client library generator. ([#104](https://www.github.com/googleapis/java-pubsub/issues/104)) ([0e366c3](https://www.github.com/googleapis/java-pubsub/commit/0e366c35580116fcd6aa40caadedd95be07bdd87))
+
 ### [1.103.1](https://www.github.com/googleapis/java-pubsub/compare/v1.103.0...v1.103.1) (2020-03-03)
 
 
