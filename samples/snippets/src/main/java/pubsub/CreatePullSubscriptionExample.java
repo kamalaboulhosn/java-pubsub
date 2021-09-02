@@ -19,34 +19,55 @@ package pubsub;
 // [START pubsub_create_pull_subscription]
 
 import com.google.cloud.pubsub.v1.SubscriptionAdminClient;
+import com.google.cloud.pubsub.v1.SubscriptionAdminSettings;
 import com.google.pubsub.v1.ProjectSubscriptionName;
 import com.google.pubsub.v1.PushConfig;
 import com.google.pubsub.v1.Subscription;
 import com.google.pubsub.v1.TopicName;
 import java.io.IOException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Semaphore;
 
 public class CreatePullSubscriptionExample {
   public static void main(String... args) throws Exception {
     // TODO(developer): Replace these variables before running the sample.
-    String projectId = "your-project-id";
-    String subscriptionId = "your-subscription-id";
-    String topicId = "your-topic-id";
+    String projectId = "ordering-keys-testing";
+    String subscriptionId = "subscription-";
+    String topicId = "lots-of-subscriptions-topic";
 
     createPullSubscriptionExample(projectId, subscriptionId, topicId);
   }
 
   public static void createPullSubscriptionExample(
       String projectId, String subscriptionId, String topicId) throws IOException {
-    try (SubscriptionAdminClient subscriptionAdminClient = SubscriptionAdminClient.create()) {
-      TopicName topicName = TopicName.of(projectId, topicId);
-      ProjectSubscriptionName subscriptionName =
-          ProjectSubscriptionName.of(projectId, subscriptionId);
-      // Create a pull subscription with default acknowledgement deadline of 10 seconds.
-      // Messages not successfully acknowledged within 10 seconds will get resent by the server.
-      Subscription subscription =
-          subscriptionAdminClient.createSubscription(
-              subscriptionName, topicName, PushConfig.getDefaultInstance(), 10);
-      System.out.println("Created pull subscription: " + subscription.getName());
+    try {
+      String endpoint = "staging-pubsub.sandbox.googleapis.com:443";
+      SubscriptionAdminSettings.Builder subscriptionAdminClientBuilder =
+          SubscriptionAdminSettings.newBuilder().setEndpoint(endpoint);
+      final SubscriptionAdminClient subscriptionAdminClient =
+          SubscriptionAdminClient.create(subscriptionAdminClientBuilder.build());
+      final TopicName topicName = TopicName.of(projectId, topicId);
+      final Semaphore s = new Semaphore(10000);
+      ExecutorService executor = Executors.newFixedThreadPool(2048);
+      for (int i = 0; i < 1000000; ++i) {
+        final int index = i;
+        final ProjectSubscriptionName subscriptionName =
+            ProjectSubscriptionName.of(projectId, subscriptionId + i);
+        s.acquire();
+        executor.submit(() -> {
+        Subscription subscription =
+            subscriptionAdminClient.createSubscription(
+                subscriptionName, topicName, PushConfig.getDefaultInstance(), 10);
+        subscriptionAdminClient.deleteSubscription(subscriptionName);
+        s.release();
+        //if (i % 10 == 0 ) {
+          System.out.println("Created " + index + "pull subscriptions");
+        //}
+        });
+      }
+    } catch (Exception e) {
+      System.out.println("No create: " + e);
     }
   }
 }
