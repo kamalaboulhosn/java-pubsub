@@ -41,13 +41,14 @@ import org.threeten.bp.Duration;
 public class PublisherExample {
   public static void main(String... args) throws Exception {
     // TODO(developer): Replace these variables before running the sample.
-    String projectId = "my-project";
-    String topicId = "my-topic";
+    String projectId = args[0];
+    String topicId = args[1];
+    String region = args[2];
 
-    publisherExample(projectId, topicId);
+    publisherExample(projectId, topicId, region);
   }
 
-  public static void publisherExample(String projectId, String topicId)
+  public static void publisherExample(String projectId, String topicId, String region)
       throws IOException, ExecutionException, InterruptedException {
     TopicName topicName = TopicName.of(projectId, topicId);
 
@@ -59,7 +60,7 @@ public class PublisherExample {
               // options are Ignore (or continue publishing) and ThrowException (or error out).
               .setLimitExceededBehavior(LimitExceededBehavior.Block)
               .setMaxOutstandingRequestBytes(10 * 1024 * 1024 * 1024L) // 10 GiB
-              .setMaxOutstandingElementCount(300000L) // 300000 messages
+              .setMaxOutstandingElementCount(500000L) // 500K messages
               .build();
 
       // By default, messages are not batched.
@@ -89,6 +90,8 @@ public class PublisherExample {
                 + itemId
                 + ", \"quantity\": "
                 + quantity
+                + " , \"region\": "
+                + region
                 + "}";
         ByteString data = ByteString.copyFromUtf8(message);
         PubsubMessage pubsubMessage = PubsubMessage.newBuilder().setData(data).build();
@@ -117,7 +120,7 @@ public class PublisherExample {
               }
             },
             MoreExecutors.directExecutor());
-        if (++published % 100000 == 0) {
+        if (++published % 1000000 == 0) {
           System.out.println("Published " + published);
         }
       }
