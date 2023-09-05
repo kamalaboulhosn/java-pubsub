@@ -32,9 +32,10 @@ import com.google.protobuf.ByteString;
 import com.google.pubsub.v1.PubsubMessage;
 import com.google.pubsub.v1.TopicName;
 import java.io.IOException;
+import java.time.Instant;
+import java.util.Random;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
-import java.util.Random;
 import org.threeten.bp.Duration;
 
 public class PublisherExample {
@@ -75,11 +76,20 @@ public class PublisherExample {
       long published = 0;
       Random rand = new Random();
       while (true) {
-        long ms = System.nanoTime() / 1000000;
+        long micros = Instant.now().toEpochMilli() * 1000;
         long userId = rand.nextInt(100000);
         int quantity = rand.nextInt(100);
         long itemId = rand.nextInt(10000);
-        String message = "{\"event_time\":" + ms + ", \"user_id\": " + userId + ", \"item_id\": " + itemId + ", \"quantity\": " + quantity + "}";
+        String message =
+            "{\"event_time\":"
+                + micros
+                + ", \"user_id\": "
+                + userId
+                + ", \"item_id\": "
+                + itemId
+                + ", \"quantity\": "
+                + quantity
+                + "}";
         ByteString data = ByteString.copyFromUtf8(message);
         PubsubMessage pubsubMessage = PubsubMessage.newBuilder().setData(data).build();
 
