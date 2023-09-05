@@ -90,9 +90,9 @@ public class PublisherExample {
                 + itemId
                 + ", \"quantity\": "
                 + quantity
-                + " , \"region\": "
+                + " , \"region\": \""
                 + region
-                + "}";
+                + "\"}";
         ByteString data = ByteString.copyFromUtf8(message);
         PubsubMessage pubsubMessage = PubsubMessage.newBuilder().setData(data).build();
 
