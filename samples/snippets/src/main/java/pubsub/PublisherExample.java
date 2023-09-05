@@ -34,6 +34,7 @@ import com.google.pubsub.v1.TopicName;
 import java.io.IOException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.Random;
 import org.threeten.bp.Duration;
 
 public class PublisherExample {
@@ -72,8 +73,13 @@ public class PublisherExample {
       publisher = Publisher.newBuilder(topicName).setBatchingSettings(batchingSettings).build();
 
       long published = 0;
+      Random rand = new Random();
       while (true) {
-        String message = "{\"event_time\": 344, \"user_id\": 145065, \"page\": \"page1.html\", \"duration\": 300}";
+        long ms = System.nanoTime() / 1000000;
+        long userId = rand.nextInt(100000);
+        int quantity = rand.nextInt(100);
+        long itemId = rand.nextInt(10000);
+        String message = "{\"event_time\":" + ms + ", \"user_id\": " + userId + ", \"item_id\": " + itemId + ", \"quantity\": " + quantity + "}";
         ByteString data = ByteString.copyFromUtf8(message);
         PubsubMessage pubsubMessage = PubsubMessage.newBuilder().setData(data).build();
 
