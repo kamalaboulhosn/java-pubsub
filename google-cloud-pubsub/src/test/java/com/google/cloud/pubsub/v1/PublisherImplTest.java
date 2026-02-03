@@ -24,6 +24,7 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import com.google.api.core.ApiFuture;
+import com.google.api.gax.retrying.RetrySettings;
 import com.google.api.gax.batching.BatchingSettings;
 import com.google.api.gax.batching.FlowControlSettings;
 import com.google.api.gax.batching.FlowController;
@@ -1354,5 +1355,217 @@ public class PublisherImplTest {
     publisher.shutdown();
     fakeExecutor.advanceTime(Duration.ofSeconds(10));
     assertTrue(publisher.awaitTermination(1, TimeUnit.MINUTES));
+  }
+  @Test
+  public void testHedgingSuccessFirstAttempt() throws Exception {
+    HedgingSettings hedgingSettings =
+        HedgingSettings.newBuilder()
+            .setTotalTimeout(Duration.ofSeconds(60))
+            .setInitialRpcDeadline(Duration.ofSeconds(10))
+            .setMaxHedgeDelay(Duration.ofSeconds(10))
+            .setRpcHedgeMultiplier(2.0)
+            .setMaxAttempts(2)
+            .setRetrySettings(
+                RetrySettings.newBuilder()
+                    .setInitialRetryDelayDuration(Duration.ofMillis(100))
+                    .setMaxRetryDelayDuration(Duration.ofMillis(100))
+                    .setRpcTimeoutMultiplier(1.0)
+                    .setInitialRpcTimeoutDuration(Duration.ofSeconds(10))
+                    .setMaxRpcTimeoutDuration(Duration.ofSeconds(10))
+                    .setTotalTimeoutDuration(Duration.ofSeconds(10))
+                    .build())
+            .build();
+
+    Publisher publisher =
+        getTestPublisherBuilder()
+            .setHedgingSettings(hedgingSettings)
+            .setBatchingSettings(
+                Publisher.Builder.DEFAULT_BATCHING_SETTINGS.toBuilder()
+                    .setElementCountThreshold(1L)
+                    .setDelayThresholdDuration(Duration.ofSeconds(100))
+                    .build())
+            .build();
+
+    testPublisherServiceImpl.addPublishResponse(PublishResponse.newBuilder().addMessageIds("1"));
+
+    ApiFuture<String> future =
+        publisher.publish(PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("msg")).build());
+
+    assertEquals("1", future.get());
+    assertEquals(1, testPublisherServiceImpl.getCapturedRequests().size());
+    publisher.shutdown();
+  }
+
+  @Test
+  public void testHedgingTriggered() throws Exception {
+    // Setup hedging to trigger after 1 second
+    HedgingSettings hedgingSettings =
+        HedgingSettings.newBuilder()
+            .setTotalTimeout(Duration.ofSeconds(60))
+            .setInitialRpcDeadline(Duration.ofSeconds(1)) // Trigger hedge after 1s
+            .setMaxHedgeDelay(Duration.ofSeconds(10))
+            .setRpcHedgeMultiplier(2.0)
+            .setMaxAttempts(2)
+            .setRetrySettings(
+                RetrySettings.newBuilder()
+                    .setTotalTimeoutDuration(Duration.ofSeconds(60))
+                    .setInitialRpcTimeoutDuration(Duration.ofSeconds(60))
+                    .setMaxRpcTimeoutDuration(Duration.ofSeconds(60))
+                    .setInitialRetryDelayDuration(Duration.ofMillis(100))
+                    .setMaxRetryDelayDuration(Duration.ofMillis(100))
+                    .setRpcTimeoutMultiplier(1.0)
+                    .build())
+            .build();
+
+    Publisher publisher =
+        getTestPublisherBuilder()
+            .setHedgingSettings(hedgingSettings)
+            .setBatchingSettings(
+                Publisher.Builder.DEFAULT_BATCHING_SETTINGS.toBuilder()
+                    .setElementCountThreshold(1L)
+                    .setDelayThresholdDuration(Duration.ofSeconds(100))
+                    .build())
+            .build();
+
+    // First request hangs (no response yet)
+
+    ApiFuture<String> future =
+        publisher.publish(PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("msg")).build());
+
+    // Advance time by 1.1s to trigger hedge
+    fakeExecutor.advanceTime(Duration.ofMillis(1100));
+
+    // Now provide response (it will be picked up by one of them)
+    testPublisherServiceImpl.addPublishResponse(PublishResponse.newBuilder().addMessageIds("1"));
+    testPublisherServiceImpl.addPublishResponse(PublishResponse.newBuilder().addMessageIds("2"));
+
+    // Wait for resolution
+    String result = future.get();
+    assertTrue("Result should be 1 or 2", result.equals("1") || result.equals("2"));
+
+    // We expect 2 requests to be sent.
+    assertTrue(testPublisherServiceImpl.getCapturedRequests().size() >= 2);
+    publisher.shutdown();
+  }
+
+  @Test(expected = IllegalArgumentException.class)
+  public void testRetryAndHedgingFailure() throws Exception {
+    HedgingSettings hedgingSettings =
+        HedgingSettings.newBuilder()
+            .setTotalTimeout(Duration.ofSeconds(60))
+            .setInitialRpcDeadline(Duration.ofSeconds(1))
+            .setMaxHedgeDelay(Duration.ofSeconds(10))
+            .setRpcHedgeMultiplier(2.0)
+            .setMaxAttempts(2)
+            .setRetrySettings(
+                RetrySettings.newBuilder()
+                    .setTotalTimeoutDuration(Duration.ofSeconds(60))
+                    .setInitialRpcTimeoutDuration(Duration.ofSeconds(60))
+                    .setMaxRpcTimeoutDuration(Duration.ofSeconds(60))
+                    .setInitialRetryDelayDuration(Duration.ofMillis(100))
+                    .setMaxRetryDelayDuration(Duration.ofMillis(100))
+                    .setRpcTimeoutMultiplier(1.0)
+                    .build())
+            .build();
+
+    Publisher.newBuilder(TEST_TOPIC)
+        .setHedgingSettings(hedgingSettings)
+        .setRetrySettings(
+            RetrySettings.newBuilder()
+                .setTotalTimeoutDuration(Duration.ofSeconds(60))
+                .build())
+        .build();
+  }
+
+  @Test
+  public void testHedgingOverridesRetryTimeouts() throws Exception {
+    Duration hedgingTotalTimeout = Duration.ofSeconds(100);
+    HedgingSettings hedgingSettings =
+        HedgingSettings.newBuilder()
+            .setTotalTimeout(hedgingTotalTimeout)
+            .setInitialRpcDeadline(Duration.ofSeconds(10))
+            .setMaxHedgeDelay(Duration.ofSeconds(10))
+            .setRpcHedgeMultiplier(2.0)
+            .setMaxAttempts(2)
+            .setRetrySettings(
+                RetrySettings.newBuilder()
+                    .setTotalTimeoutDuration(Duration.ofSeconds(1)) // Should be overridden
+                    .setInitialRpcTimeoutDuration(Duration.ofSeconds(1)) // Should be overridden
+                    .setMaxRpcTimeoutDuration(Duration.ofSeconds(60))
+                    .setInitialRetryDelayDuration(Duration.ofMillis(100))
+                    .setMaxRetryDelayDuration(Duration.ofMillis(100))
+                    .setRpcTimeoutMultiplier(1.0)
+                    .build())
+            .build();
+
+    Publisher publisher =
+        getTestPublisherBuilder().setHedgingSettings(hedgingSettings).build();
+
+    // Access private field to verify
+    RetrySettings actualRetrySettings = publisher.getRetrySettings();
+
+    assertEquals(hedgingTotalTimeout, actualRetrySettings.getTotalTimeoutDuration());
+    assertEquals(hedgingTotalTimeout, actualRetrySettings.getInitialRpcTimeoutDuration());
+    publisher.shutdown();
+  }
+
+  @Test
+  public void testHedgingRespectsRetryLimitWithOrdering() throws Exception {
+    HedgingSettings hedgingSettings =
+        HedgingSettings.newBuilder()
+            .setTotalTimeout(Duration.ofSeconds(100))
+            .setInitialRpcDeadline(Duration.ofSeconds(10))
+            .setMaxHedgeDelay(Duration.ofSeconds(10))
+            .setRpcHedgeMultiplier(2.0)
+            .setMaxAttempts(2)
+            .setRetrySettings(
+                RetrySettings.newBuilder()
+                    .setTotalTimeoutDuration(Duration.ofSeconds(100))
+                    .setInitialRpcTimeoutDuration(Duration.ofSeconds(100))
+                    .setMaxRpcTimeoutDuration(Duration.ofSeconds(100))
+                    .setInitialRetryDelayDuration(Duration.ofMillis(100))
+                    .setMaxRetryDelayDuration(Duration.ofMillis(100))
+                    .setRpcTimeoutMultiplier(1.0)
+                    .setMaxAttempts(5) // Specific limit
+                    .build())
+            .build();
+
+    Publisher publisher =
+        getTestPublisherBuilder()
+            .setHedgingSettings(hedgingSettings)
+            .setEnableMessageOrdering(true)
+            .build();
+
+    // Access private field to verify
+    RetrySettings actualRetrySettings = publisher.getRetrySettings();
+
+    // Should NOT be Integer.MAX_VALUE
+    assertEquals(5, actualRetrySettings.getMaxAttempts());
+    publisher.shutdown();
+  }
+
+  @Test
+  public void testHedgingSettingsDefaultsRetrySettings() throws Exception {
+    Duration hedgingTotalTimeout = Duration.ofSeconds(100);
+    HedgingSettings hedgingSettings =
+        HedgingSettings.newBuilder()
+            .setTotalTimeout(hedgingTotalTimeout)
+            .setInitialRpcDeadline(Duration.ofSeconds(10))
+            .setMaxHedgeDelay(Duration.ofSeconds(10))
+            .setRpcHedgeMultiplier(2.0)
+            .setMaxAttempts(2)
+            // No setRetrySettings()
+            .build();
+
+    Publisher publisher =
+        getTestPublisherBuilder().setHedgingSettings(hedgingSettings).build();
+
+    RetrySettings actualRetrySettings = publisher.getRetrySettings();
+
+    // Verify it's not null and has overridden timeouts
+    assertThat(actualRetrySettings).isNotNull();
+    assertEquals(hedgingTotalTimeout, actualRetrySettings.getTotalTimeoutDuration());
+    assertEquals(hedgingTotalTimeout, actualRetrySettings.getInitialRpcTimeoutDuration());
+    publisher.shutdown();
   }
 }

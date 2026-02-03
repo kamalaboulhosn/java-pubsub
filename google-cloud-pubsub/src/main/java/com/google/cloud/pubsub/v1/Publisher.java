@@ -53,12 +53,14 @@ import com.google.pubsub.v1.PubsubMessage;
 import com.google.pubsub.v1.TopicName;
 import com.google.pubsub.v1.TopicNames;
 import io.grpc.CallOptions;
+import io.grpc.Status;
 import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.Tracer;
 import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedList;
@@ -66,10 +68,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.logging.Level;
@@ -135,6 +139,8 @@ public class Publisher implements PublisherInterface {
   private final boolean enableOpenTelemetryTracing;
   private final OpenTelemetry openTelemetry;
   private OpenTelemetryPubsubTracer tracer = new OpenTelemetryPubsubTracer(null, false);
+  private final HedgingSettings hedgingSettings;
+  private final RetrySettings retrySettings;
 
   /** The maximum number of messages in one request. Defined by the API. */
   public static long getApiMaxRequestElementCount() {
@@ -191,11 +197,33 @@ public class Publisher implements PublisherInterface {
     // We post-process this here to keep backward-compatibility.
     // Also, if "message ordering" is enabled, the publisher should retry sending the failed
     // message infinitely rather than sending the next one.
-    RetrySettings.Builder retrySettingsBuilder = builder.retrySettings.toBuilder();
+    this.hedgingSettings = builder.hedgingSettings;
+    RetrySettings.Builder retrySettingsBuilder;
+    if (this.hedgingSettings != null) {
+      RetrySettings hedgingRetrySettings = this.hedgingSettings.getRetrySettings();
+      if (hedgingRetrySettings != null) {
+        retrySettingsBuilder = hedgingRetrySettings.toBuilder();
+      } else {
+        retrySettingsBuilder = Builder.DEFAULT_RETRY_SETTINGS.toBuilder();
+      }
+      // If hedging is enabled, the total timeout generally controls the overall execution time.
+      // We set the initial RPC timeout, max RPC timeout, and total timeout of the retry settings
+      // to the hedging total timeout to ensure that individual RPCs are not cut short unexpectedly.
+      retrySettingsBuilder.setInitialRpcTimeoutDuration(this.hedgingSettings.getTotalTimeout());
+      retrySettingsBuilder.setMaxRpcTimeoutDuration(this.hedgingSettings.getTotalTimeout());
+      retrySettingsBuilder.setTotalTimeoutDuration(this.hedgingSettings.getTotalTimeout());
+    } else {
+      retrySettingsBuilder = builder.retrySettings.toBuilder();
+    }
+
     if (retrySettingsBuilder.getMaxAttempts() == 0) {
       retrySettingsBuilder.setMaxAttempts(Integer.MAX_VALUE);
     }
-    if (enableMessageOrdering) {
+    // If message ordering is enabled, we generally want indefinite retries to avoid breaking
+    // ordering guarantees. However, if the user has explicitly provided HedgingSettings
+    // (which includes its own RetrySettings), we respect those settings and do not force
+    // infinite retries.
+    if (enableMessageOrdering && this.hedgingSettings == null) {
       // TODO: is there a way to have the default retry settings for requests without an ordering
       // key?
       retrySettingsBuilder
@@ -223,6 +251,7 @@ public class Publisher implements PublisherInterface {
             StatusCode.Code.UNAVAILABLE)
         .setRetrySettings(retrySettingsBuilder.build())
         .setBatchingSettings(BatchingSettings.newBuilder().setIsEnabled(false).build());
+    this.retrySettings = retrySettingsBuilder.build();
     this.publisherStub = GrpcPublisherStub.create(stubSettings.build());
     backgroundResourceList.add(publisherStub);
     backgroundResources = new BackgroundResourceAggregation(backgroundResourceList);
@@ -509,54 +538,22 @@ public class Publisher implements PublisherInterface {
       logger.log(Level.WARNING, "Attempted to publish batch with zero messages.");
       return;
     }
+
+    if (hedgingSettings != null) {
+      hedgedPublish(outstandingBatch);
+      return;
+    }
+
     final ApiFutureCallback<PublishResponse> futureCallback =
         new ApiFutureCallback<PublishResponse>() {
           @Override
           public void onSuccess(PublishResponse result) {
-            try {
-              if (result == null || result.getMessageIdsCount() != outstandingBatch.size()) {
-                outstandingBatch.onFailure(
-                    new IllegalStateException(
-                        String.format(
-                            "The publish result count %s does not match "
-                                + "the expected %s results. Please contact Cloud Pub/Sub support "
-                                + "if this frequently occurs",
-                            result.getMessageIdsCount(), outstandingBatch.size())));
-              } else {
-                outstandingBatch.onSuccess(result.getMessageIdsList());
-                if (!activeAlarm.get()
-                    && outstandingBatch.orderingKey != null
-                    && !outstandingBatch.orderingKey.isEmpty()) {
-                  publishAllWithoutInflightForKey(outstandingBatch.orderingKey);
-                }
-              }
-            } finally {
-              messagesWaiter.incrementPendingCount(-outstandingBatch.size());
-            }
+            handleBatchSuccess(outstandingBatch, result);
           }
 
           @Override
           public void onFailure(Throwable t) {
-            try {
-              if (outstandingBatch.orderingKey != null && !outstandingBatch.orderingKey.isEmpty()) {
-                messagesBatchLock.lock();
-                try {
-                  MessagesBatch messagesBatch = messagesBatches.get(outstandingBatch.orderingKey);
-                  if (messagesBatch != null) {
-                    for (OutstandingPublish outstanding : messagesBatch.messages) {
-                      outstanding.publishResult.setException(
-                          SequentialExecutorService.CallbackExecutor.CANCELLATION_EXCEPTION);
-                    }
-                    messagesBatches.remove(outstandingBatch.orderingKey);
-                  }
-                } finally {
-                  messagesBatchLock.unlock();
-                }
-              }
-              outstandingBatch.onFailure(t);
-            } finally {
-              messagesWaiter.incrementPendingCount(-outstandingBatch.size());
-            }
+            handleBatchFailure(outstandingBatch, t);
           }
         };
 
@@ -575,6 +572,216 @@ public class Publisher implements PublisherInterface {
               });
     }
     ApiFutures.addCallback(future, futureCallback, directExecutor());
+  }
+
+  private void hedgedPublish(final OutstandingBatch outstandingBatch) {
+    long initialRpcDeadlineMillis = hedgingSettings.getInitialRpcDeadline().toMillis();
+    long maxHedgeDelayMillis = hedgingSettings.getMaxHedgeDelay().toMillis();
+    double rpcHedgeMultiplier = hedgingSettings.getRpcHedgeMultiplier();
+
+    final AtomicBoolean batchDone = new AtomicBoolean(false);
+    // Use a synchronized list to track futures so we can cancel them all
+    final List<Future<?>> promptFutures =
+        Collections.synchronizedList(new ArrayList<Future<?>>());
+    final AtomicInteger failureCount = new AtomicInteger(0);
+
+    long totalTimeoutMillis = hedgingSettings.getTotalTimeout().toMillis();
+    Future<?> timeoutFuture =
+        executor.schedule(
+            new Runnable() {
+              @Override
+              public void run() {
+                if (batchDone.compareAndSet(false, true)) {
+                  cancelFutures(promptFutures);
+                  handleBatchFailure(
+                      outstandingBatch,
+                      Status.DEADLINE_EXCEEDED
+                          .withDescription("Total timeout exceeded")
+                          .asRuntimeException());
+                }
+              }
+            },
+            totalTimeoutMillis,
+            TimeUnit.MILLISECONDS);
+    promptFutures.add(timeoutFuture);
+
+    // Attempt 1
+    scheduleHedge(outstandingBatch, batchDone, promptFutures, failureCount);
+
+    // Schedule subsequent attempts
+    if (hedgingSettings.getMaxAttempts() > 1) {
+      final long initialDelay = initialRpcDeadlineMillis;
+      Future<?> promptFuture =
+          executor.schedule(
+              new Runnable() {
+                @Override
+                public void run() {
+                  runRecursiveHedge(
+                      outstandingBatch,
+                      batchDone,
+                      promptFutures,
+                      failureCount,
+                      2,
+                      initialDelay);
+                }
+              },
+              initialDelay,
+              TimeUnit.MILLISECONDS);
+      promptFutures.add(promptFuture);
+    }
+  }
+
+  private void runRecursiveHedge(
+      final OutstandingBatch outstandingBatch,
+      final AtomicBoolean batchDone,
+      final List<Future<?>> promptFutures,
+      final AtomicInteger failureCount,
+      final int attempt,
+      final long currentAccumulatedDelay) {
+    if (batchDone.get()) {
+      return;
+    }
+
+    scheduleHedge(outstandingBatch, batchDone, promptFutures, failureCount);
+
+    if (attempt < hedgingSettings.getMaxAttempts()) {
+      long maxHedgeDelayMillis = hedgingSettings.getMaxHedgeDelay().toMillis();
+      double rpcHedgeMultiplier = hedgingSettings.getRpcHedgeMultiplier();
+
+      long nextAccumulatedDelay = (long) (currentAccumulatedDelay * rpcHedgeMultiplier);
+      if (nextAccumulatedDelay > maxHedgeDelayMillis) {
+        nextAccumulatedDelay = maxHedgeDelayMillis;
+      }
+      // Add up to 10% jitter
+      nextAccumulatedDelay += (long) (nextAccumulatedDelay * Math.random() * 0.1);
+
+      long waitDuration = nextAccumulatedDelay - currentAccumulatedDelay;
+      // In case jitter or cap caused next to be earlier (unlikely due to multiplier > 1, but safety)
+      if (waitDuration < 0) {
+        waitDuration = 0;
+      }
+
+      final long nextDelayParam = nextAccumulatedDelay;
+
+      Future<?> promptFuture =
+          executor.schedule(
+              new Runnable() {
+                @Override
+                public void run() {
+                  runRecursiveHedge(
+                      outstandingBatch,
+                      batchDone,
+                      promptFutures,
+                      failureCount,
+                      attempt + 1,
+                      nextDelayParam);
+                }
+              },
+              waitDuration,
+              TimeUnit.MILLISECONDS);
+      promptFutures.add(promptFuture);
+    }
+  }
+
+  private void scheduleHedge(
+      final OutstandingBatch outstandingBatch,
+      final AtomicBoolean batchDone,
+      final List<Future<?>> promptFutures,
+      final AtomicInteger failureCount) {
+    if (batchDone.get()) {
+      return;
+    }
+
+    ApiFuture<PublishResponse> future;
+    if (outstandingBatch.orderingKey == null || outstandingBatch.orderingKey.isEmpty()) {
+      future = publishCall(outstandingBatch);
+    } else {
+      future =
+          sequentialExecutor.submit(
+              outstandingBatch.orderingKey,
+              new Callable<ApiFuture<PublishResponse>>() {
+                public ApiFuture<PublishResponse> call() {
+                  return publishCall(outstandingBatch);
+                }
+              });
+    }
+    promptFutures.add(future);
+
+    ApiFutures.addCallback(
+        future,
+        new ApiFutureCallback<PublishResponse>() {
+          @Override
+          public void onSuccess(PublishResponse result) {
+            if (batchDone.compareAndSet(false, true)) {
+              cancelFutures(promptFutures);
+              handleBatchSuccess(outstandingBatch, result);
+            }
+          }
+
+          @Override
+          public void onFailure(Throwable t) {
+            if (failureCount.incrementAndGet() == hedgingSettings.getMaxAttempts()) {
+              if (batchDone.compareAndSet(false, true)) {
+                handleBatchFailure(outstandingBatch, t);
+              }
+            }
+          }
+        },
+        directExecutor());
+  }
+
+  private void cancelFutures(List<Future<?>> futures) {
+    synchronized (futures) {
+      for (Future<?> f : futures) {
+        f.cancel(true);
+      }
+    }
+  }
+
+  private void handleBatchSuccess(OutstandingBatch outstandingBatch, PublishResponse result) {
+    try {
+      if (result == null || result.getMessageIdsCount() != outstandingBatch.size()) {
+        outstandingBatch.onFailure(
+            new IllegalStateException(
+                String.format(
+                    "The publish result count %s does not match "
+                        + "the expected %s results. Please contact Cloud Pub/Sub support "
+                        + "if this frequently occurs",
+                    result.getMessageIdsCount(), outstandingBatch.size())));
+      } else {
+        outstandingBatch.onSuccess(result.getMessageIdsList());
+        if (!activeAlarm.get()
+            && outstandingBatch.orderingKey != null
+            && !outstandingBatch.orderingKey.isEmpty()) {
+          publishAllWithoutInflightForKey(outstandingBatch.orderingKey);
+        }
+      }
+    } finally {
+      messagesWaiter.incrementPendingCount(-outstandingBatch.size());
+    }
+  }
+
+  private void handleBatchFailure(OutstandingBatch outstandingBatch, Throwable t) {
+    try {
+      if (outstandingBatch.orderingKey != null && !outstandingBatch.orderingKey.isEmpty()) {
+        messagesBatchLock.lock();
+        try {
+          MessagesBatch messagesBatch = messagesBatches.get(outstandingBatch.orderingKey);
+          if (messagesBatch != null) {
+            for (OutstandingPublish outstanding : messagesBatch.messages) {
+              outstanding.publishResult.setException(
+                  SequentialExecutorService.CallbackExecutor.CANCELLATION_EXCEPTION);
+            }
+            messagesBatches.remove(outstandingBatch.orderingKey);
+          }
+        } finally {
+          messagesBatchLock.unlock();
+        }
+      }
+      outstandingBatch.onFailure(t);
+    } finally {
+      messagesWaiter.incrementPendingCount(-outstandingBatch.size());
+    }
   }
 
   private final class OutstandingBatch {
@@ -653,6 +860,11 @@ public class Publisher implements PublisherInterface {
     return batchingSettings;
   }
 
+  /** The retry settings configured on this {@code Publisher}. */
+  public RetrySettings getRetrySettings() {
+    return retrySettings;
+  }
+
   /**
    * Schedules immediate publishing of any outstanding messages and waits until all are processed.
    *
@@ -724,6 +936,8 @@ public class Publisher implements PublisherInterface {
   public static Builder newBuilder(String topicName) {
     return new Builder(topicName);
   }
+
+
 
   /** A builder of {@link Publisher}s. */
   public static final class Builder {
@@ -803,6 +1017,8 @@ public class Publisher implements PublisherInterface {
 
     private boolean enableOpenTelemetryTracing = false;
     private OpenTelemetry openTelemetry = null;
+    private HedgingSettings hedgingSettings = null;
+    private boolean retrySettingsConfigured = false;
 
     private Builder(String topic) {
       this.topicName = Preconditions.checkNotNull(topic);
@@ -881,7 +1097,12 @@ public class Publisher implements PublisherInterface {
           retrySettings.getTotalTimeoutDuration().compareTo(MIN_TOTAL_TIMEOUT) >= 0);
       Preconditions.checkArgument(
           retrySettings.getInitialRpcTimeoutDuration().compareTo(MIN_RPC_TIMEOUT) >= 0);
+      Preconditions.checkArgument(
+          hedgingSettings == null,
+          "retrySettings and hedgingSettings cannot both be set. "
+              + "When hedging is enabled, RetrySettings should be set on HedgingSettings.");
       this.retrySettings = retrySettings;
+      this.retrySettingsConfigured = true;
       return this;
     }
 
@@ -938,20 +1159,31 @@ public class Publisher implements PublisherInterface {
     /**
      * OpenTelemetry will be enabled if setEnableOpenTelemetry is true and and instance of
      * OpenTelemetry has been provied. Warning: traces are subject to change. The name and
-     * attributes of a span might change without notice. Only use run traces interactively. Don't
-     * use in automation. Running non-interactive traces can cause problems if the underlying trace
-     * architecture changes without notice.
+     * structure of the spans are not guaranteed to be stable and may change in the future.
      */
+    public Builder setOpenTelemetry(OpenTelemetry openTelemetry) {
+      this.openTelemetry = openTelemetry;
+      return this;
+    }
 
-    /** Gives the ability to enable Open Telemetry Tracing */
+    /**
+     * Enable or disable OpenTelemetry tracing.
+     *
+     * <p>Warning: traces are subject to change. The name and structure of the spans are not
+     * guaranteed to be stable and may change in the future.
+     */
     public Builder setEnableOpenTelemetryTracing(boolean enableOpenTelemetryTracing) {
       this.enableOpenTelemetryTracing = enableOpenTelemetryTracing;
       return this;
     }
 
-    /** Sets the instance of OpenTelemetry for the Publisher class. */
-    public Builder setOpenTelemetry(OpenTelemetry openTelemetry) {
-      this.openTelemetry = openTelemetry;
+    /** Sets the hedging settings. */
+    public Builder setHedgingSettings(HedgingSettings hedgingSettings) {
+      Preconditions.checkArgument(
+          !retrySettingsConfigured,
+          "retrySettings and hedgingSettings cannot both be set. "
+              + "When hedging is enabled, RetrySettings should be set on HedgingSettings.");
+      this.hedgingSettings = hedgingSettings;
       return this;
     }
 

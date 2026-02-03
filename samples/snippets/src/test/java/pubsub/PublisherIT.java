@@ -112,6 +112,11 @@ public class PublisherIT {
     assertThat(bout.toString()).contains("Published a message with retry settings: ");
 
     bout.reset();
+    // Test publish with Hedging settings.
+    PublishWithHedgingSettingsExample.publishWithHedgingSettingsExample(projectId, topicId);
+    assertThat(bout.toString()).contains("Published a message with hedging settings: ");
+
+    bout.reset();
     // Test publish with ordering keys.
     PublishWithOrderingKeys.publishWithOrderingKeysExample(projectId, topicId);
     for (int i = 1; i <= 4; i++) {
